@@ -1,4 +1,7 @@
-# Config format schema number, the yaml support to valid case source from different dataset
+# Flow-SMART training config.
+# 공개 SMART train_scalable.yaml을 그대로 따르되,
+# 미래 생성 head만 flow matching으로 바꾼 설정이다.
+
 time_info: &time_info
   num_historical_steps: 11
   num_future_steps: 80
@@ -52,6 +55,12 @@ Model:
   lr: 0.0005
   warmup_steps: 0
   total_steps: 32
+
+  # flow head only
+  train_stage: "open_loop"  # open_loop | closed_loop
+  flow_ode_steps: 4
+  closed_loop_unroll: 4
+
   decoder:
     <<: *time_info
     num_map_layers: 3
