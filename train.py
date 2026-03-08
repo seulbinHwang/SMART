@@ -13,7 +13,7 @@ from smart.utils.log import Logging
 if __name__ == '__main__':
     parser = ArgumentParser()
     Predictor_hash = {"smart": SMART, }
-    parser.add_argument('--config', type=str, default='configs/train/train_scalable.yaml')
+    parser.add_argument('--config', type=str, default='configs/train/train_flow.yaml')
     parser.add_argument('--pretrain_ckpt', type=str, default="")
     parser.add_argument('--ckpt_path', type=str, default="")
     parser.add_argument('--save_ckpt_path', type=str, default="")
@@ -34,10 +34,10 @@ if __name__ == '__main__':
     trainer_config = config.Trainer
     model_checkpoint = ModelCheckpoint(dirpath=args.save_ckpt_path,
                                        filename="{epoch:02d}",
-                                       monitor='val_cls_acc',
+                                       monitor='val_minADE',
                                        every_n_epochs=1,
                                        save_top_k=5,
-                                       mode='max')
+                                       mode='min')
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
     trainer = pl.Trainer(accelerator=trainer_config.accelerator, devices=trainer_config.devices,
                          strategy=strategy,

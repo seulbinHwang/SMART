@@ -1,30 +1,51 @@
 <div align="center">
-  
-  # SMART: Scalable Multi-agent Real-time Motion Generation via Next-token Prediction
-  
-  [Paper](https://arxiv.org/abs/2405.15677) | [Webpage](https://smart-motion.github.io/smart/)
+
+# SMART Flow
+
+RoadNet + SMART history memory + sparse factorized flow matching decoder for multi-agent motion generation.
 
 </div>
 
-- **Ranked 1st** on the [Waymo Open Sim Agents Challenge 2024](https://waymo.com/open/challenges/2024/sim-agents/)  
-- **Champion** of the [Waymo Open Sim Agents Challenge 2024](https://waymo.com/open/challenges/2024/sim-agents/) at the [CVPR 2024 Workshop on Autonomous Driving (WAD)](https://cvpr2024.wad.vision/)
+## Overview
 
-## News
-- **[December 31, 2024]** SMART-Planner achieved state-of-the-art performance on **nuPlan closed-loop planning**
-- **[September 26, 2024]** SMART was **accepted to** NeurIPS 2024
-- **[August 31, 2024]** Code released
-- **[May 24, 2024]** SMART won the championship of the [Waymo Open Sim Agents Challenge 2024](https://waymo.com/open/challenges/2024/sim-agents/) at the [CVPR 2024 Workshop on Autonomous Driving (WAD)](https://cvpr2024.wad.vision/)
-- **[May 24, 2024]** SMART paper released on [arxiv](https://arxiv.org/abs/2405.15677)
+This fork keeps the original SMART map/token preprocessing pipeline and replaces the agent next-token prediction head with a sparse factorized conditional flow matching head.
 
+What stays the same:
 
-## Introduction
-This repository contains the official implementation of SMART: Scalable Multi-agent Real-time Motion Generation via Next-token Prediction. SMART is a novel autonomous driving motion generation paradigm that models vectorized map and agent trajectory data into discrete sequence tokens.
+- `smart/modules/map_decoder.py`: RoadNet-style map encoder
+- agent/map token preprocessing
+- training and validation entrypoints: `train.py`, `val.py`
+- SMART-style sparse factorized context encoding: temporal, map-to-agent, agent-to-agent
 
-https://github.com/user-attachments/assets/74a61627-8444-4e54-bb10-d317dd2aacd9
+What changes:
 
-## Requirements
+- `smart/modules/agent_flow_decoder.py`: 2.0 s future generator
+- `smart/utils/flow_traj.py`: chunking, OT noising, assembly, midpoint ODE, warm-start helpers
+- `smart/model/smart.py`: flow loss, overlap loss, rollout validation
 
-To set up the environment, you can use conda to create and activate a new environment with the necessary dependencies:
+The implemented agent head uses:
+
+- 2.0 s future window
+- 4 overlapping 0.5 s segments (`6` points each, overlap `1`)
+- 3 s causal token history from SMART factorized context encoding
+- current-state anchor token
+- joint all-agent training target selection
+- open-loop pretraining and optional short closed-loop fine-tuning
+
+## Repository Layout
+
+- [train.py](/home/user/PycharmProjects/SMART/train.py): training entrypoint
+- [val.py](/home/user/PycharmProjects/SMART/val.py): validation entrypoint
+- [smart/model/smart.py](/home/user/PycharmProjects/SMART/smart/model/smart.py): Lightning module, losses, rollout metrics
+- [smart/modules/agent_flow_decoder.py](/home/user/PycharmProjects/SMART/smart/modules/agent_flow_decoder.py): flow decoder
+- [smart/utils/flow_traj.py](/home/user/PycharmProjects/SMART/smart/utils/flow_traj.py): flow trajectory helpers
+- [configs/train/train_flow.yaml](/home/user/PycharmProjects/SMART/configs/train/train_flow.yaml): open-loop pretraining config
+- [configs/train/train_flow_finetune.yaml](/home/user/PycharmProjects/SMART/configs/train/train_flow_finetune.yaml): short closed-loop fine-tuning config
+- [configs/validation/validation_flow.yaml](/home/user/PycharmProjects/SMART/configs/validation/validation_flow.yaml): validation config
+
+## Environment
+
+The flow implementation does not add a new external diffusion dependency. It uses the original SMART stack plus local OT noising and midpoint ODE code.
 
 ```bash
 conda env create -f environment.yml
@@ -32,112 +53,135 @@ conda activate SMART
 pip install -r requirements.txt
 ```
 
-If you encounter issues while installing pyg dependencies, execute the following script:
-```setup
-bash install_pyg.sh
+If PyG installation fails:
+
+```bash
+bash scripts/install_pyg.sh
 ```
 
-Alternatively, you can configure the environment in your preferred way. Installing the latest versions of PyTorch, PyG, and PyTorch Lightning should suffice.
+You still need the Waymo Open Dataset API if you train or validate on WOMD/WOSAC-format data.
 
-## Data installation
+## Data Preparation
 
-**Step 1: Download the Dataset**
+Expected raw data layout:
 
-Download the Waymo Open Motion Dataset (`scenario protocol` format) and organize the data as follows:
-```
+```text
 SMART
 ├── data
 │   ├── waymo
 │   │   ├── scenario
-│   │   │   ├──training
-│   │   │   ├──validation
-│   │   │   ├──testing
-├── model
-├── tools
+│   │   │   ├── training
+│   │   │   ├── validation
+│   │   │   ├── testing
 ```
 
-**Step 2: Install the Waymo Open Dataset API**
+Preprocess raw scenarios:
 
-Follow the instructions [here](https://github.com/waymo-research/waymo-open-dataset) to install the Waymo Open Dataset API.
-
-**Step 3: Preprocess the Dataset**
-
-Preprocess the dataset by running:
+```bash
+python data_preprocess.py \
+  --input_dir ./data/waymo/scenario/training \
+  --output_dir ./data/waymo_processed/training
 ```
-python data_preprocess.py --input_dir ./data/waymo/scenario/training  --output_dir ./data/waymo_processed/training
-```
-The first path is the raw data path, and the second is the output data path.
 
-The processed data will be saved to the `data/waymo_processed/` directory as follows:
+Do the same for validation/testing if needed.
 
-```
-SMART
-├── data
-│   ├── waymo_processed
-│   │   ├── training
-│   │   ├── validation
-│   │   ├──testing
-├── model
-├── utils
-```
+The sample configs currently point to `data/valid_demo` for quick smoke tests. Before real training, edit the `train_raw_dir` and `val_raw_dir` fields in the config files.
 
 ## Training
 
-To train the model, run the following command:
+### 1. Open-loop pretraining
 
-```train
-python train.py --config ${config_path}
+```bash
+python train.py \
+  --config configs/train/train_flow.yaml \
+  --save_ckpt_path ./checkpoints/flow_pretrain
 ```
 
-The default config path is `configs/train/train_scalable.yaml`. Ensure you have downloaded and prepared the Waymo data for training.
+What this does:
 
-## Evaluation
+- reuses SMART map preprocessing and map encoder
+- samples up to `anchor_chunk_k=4` anchors per scene
+- predicts 4 future segments over a 2.0 s window
+- optimizes `flow_loss + overlap_loss`
 
-To evaluate the model, run:
+Checkpoint selection monitors `val_minADE` and keeps the best 5 checkpoints.
 
-```eval
-python eval.py --config ${config_path} --pretrain_ckpt ${ckpt_path}
-```
-This will evaluate the model using the configuration and checkpoint provided.
+### 2. Short closed-loop fine-tuning
 
+After pretraining, run:
 
-## Pre-trained Models
-
-To comply with the WOMD participation agreement, we will release the model parameters of a medium-sized model not trained on Waymo data. Users can fine-tune this model with Waymo data as needed.
-
-## Results
-
-### Waymo Open Motion Dataset Sim Agents Challenge
-
-Our model achieves the following performance on the [Waymo Open Motion Dataset Sim Agents Challenge](https://waymo.com/open/challenges/2024/sim-agents/):
-
-| Model name    | Metric Score |
-| :-----------: | ------------ |
-| SMART-tiny    | 0.7591       |
-| SMART-large   | 0.7614       |
-| SMART-zeroshot| 0.7210       |
-
-### NuPlan Closed-loop Planning
-
-**SMART-Planner** achieved state-of-the-art performance among learning-based algorithms on **nuPlan closed-loop planning**. The results on val14 are shown below:
-
-![nuPlan Closed-loop Planning](assets/result1.png)
-
-## Citation 
-
-If you find this repository useful, please consider citing our work and giving us a star:
-
-```citation
-@article{wu2024smart,
-  title={SMART: Scalable Multi-agent Real-time Simulation via Next-token Prediction},
-  author={Wu, Wei and Feng, Xiaoxin and Gao, Ziyan and Kan, Yuheng},
-  journal={arXiv preprint arXiv:2405.15677},
-  year={2024}
-}
+```bash
+python train.py \
+  --config configs/train/train_flow_finetune.yaml \
+  --pretrain_ckpt ./checkpoints/flow_pretrain/epoch=XX.ckpt \
+  --save_ckpt_path ./checkpoints/flow_finetune
 ```
 
-## Acknowledgements
-Special thanks to the [QCNET](https://github.com/ZikangZhou/QCNet) repository for providing valuable reference code that significantly influenced this work. 
+What changes in this stage:
 
-## License
-All code in this repository is licensed under the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0).
+- learning rate is reduced
+- `closed_loop_steps=4`
+- the training loss becomes `flow_loss + overlap_loss + short_rollout_loss`
+
+This keeps the code path the same. There is no second trainer script.
+
+## Validation
+
+```bash
+python val.py \
+  --config configs/validation/validation_flow.yaml \
+  --pretrain_ckpt ./checkpoints/flow_finetune/epoch=YY.ckpt
+```
+
+Validation runs:
+
+- open-loop flow loss
+- full 8 s closed-loop rollout
+- `val_minADE`
+- `val_minFDE`
+
+## Minimal Config Surface
+
+The new implementation only introduces four decoder-side runtime controls:
+
+- `future_window_steps: 20`
+- `ode_steps: 4`
+- `anchor_chunk_k: 4`
+- `closed_loop_steps: 0` or `4`
+
+Everything else stays aligned with the original SMART defaults:
+
+- `hidden_dim: 128`
+- `num_agent_layers: 6`
+- `pl2a_radius: 30`
+- `a2a_radius: 60`
+- `time_span: 30`
+- `shift: 5`
+
+## Important Notes
+
+- The agent NTP training path is no longer used by `train.py` or `val.py`.
+- Map token masking and map encoder behavior are unchanged.
+- Joint all-agent training is enabled by removing the previous random 32-agent cap in `WaymoTargetBuilder`.
+- The implementation intentionally keeps sparse factorized attention instead of importing Flow-Planner's global fusion blocks.
+
+## Practical Run Order
+
+1. Install dependencies.
+2. Preprocess Waymo data.
+3. Edit the raw/processed data paths inside [configs/train/train_flow.yaml](/home/user/PycharmProjects/SMART/configs/train/train_flow.yaml) and [configs/validation/validation_flow.yaml](/home/user/PycharmProjects/SMART/configs/validation/validation_flow.yaml).
+4. Run open-loop pretraining.
+5. Run short closed-loop fine-tuning from the best pretrain checkpoint.
+6. Run validation on the fine-tuned checkpoint.
+
+## Verification Performed In This Workspace
+
+Static syntax verification passed for the modified code:
+
+```bash
+python3 -m py_compile train.py val.py smart/model/smart.py \
+  smart/modules/smart_decoder.py smart/modules/agent_flow_decoder.py \
+  smart/utils/flow_traj.py smart/transforms/target_builder.py
+```
+
+Full training/rollout execution was not run in this workspace because the current Python environment does not have the project dependencies installed.

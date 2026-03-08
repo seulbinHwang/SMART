@@ -106,12 +106,6 @@ class WaymoTargetBuilder(BaseTransform):
         counts_vehicle = valid_counts >= 1
         no_backgroud = agent['type'] != 3
         vehicle2pred = closet_vehicle & counts_vehicle & no_backgroud
-        if vehicle2pred.sum() > max_num:
-            # too many still vehicle so that train the model using the moving vehicle as much as possible
-            true_indices = torch.nonzero(vehicle2pred).squeeze(1)
-            selected_indices = true_indices[torch.randperm(true_indices.size(0))[:max_num]]
-            vehicle2pred.fill_(False)
-            vehicle2pred[selected_indices] = True
         agent["category"][vehicle2pred] = 3
 
     def rotate_agents(self, position, heading, num_nodes, num_historical_steps, num_future_steps):

@@ -3,6 +3,14 @@ from smart.utils.geometry import angle_between_2d_vectors
 from smart.utils.geometry import angle_between_3d_vectors
 from smart.utils.geometry import side_to_directed_lineseg
 from smart.utils.geometry import wrap_angle
+from smart.utils.flow_traj import assemble_4x6_to_21
+from smart.utils.flow_traj import build_ot_flow_path
+from smart.utils.flow_traj import chunk_future_21_to_4x6
+from smart.utils.flow_traj import local_to_global_future
+from smart.utils.flow_traj import midpoint_ode
+from smart.utils.flow_traj import normalize_heading_components
+from smart.utils.flow_traj import trajectory_to_local_frame
+from smart.utils.flow_traj import warm_start_from_previous
 from smart.utils.graph import add_edges
 from smart.utils.graph import bipartite_dense_to_sparse
 from smart.utils.graph import complete_graph

@@ -6,7 +6,6 @@ from torch_geometric.data import Batch
 from torch_geometric.data import HeteroData
 from smart.metrics import minADE
 from smart.metrics import minFDE
-from smart.metrics import TokenCls
 from smart.modules import SMARTDecoder
 from torch.optim.lr_scheduler import LambdaLR
 import math
@@ -66,6 +65,8 @@ class SMART(pl.LightningModule):
         self.output_head = model_config.output_head
         self.num_historical_steps = model_config.num_historical_steps
         self.num_future_steps = model_config.decoder.num_future_steps
+        self.future_window_steps = model_config.decoder.future_window_steps
+        self.closed_loop_steps = getattr(model_config.decoder, 'closed_loop_steps', 0)
         self.num_freq_bands = model_config.num_freq_bands
         self.vis_map = False
         self.noise = True
@@ -91,17 +92,15 @@ class SMART(pl.LightningModule):
             time_span=model_config.decoder.time_span,
             map_token={'traj_src': self.map_token['traj_src']},
             token_data=token_data,
+            future_window_steps=model_config.decoder.future_window_steps,
+            ode_steps=model_config.decoder.ode_steps,
+            anchor_chunk_k=model_config.decoder.anchor_chunk_k,
             token_size=model_config.decoder.token_size
         )
         self.minADE = minADE(max_guesses=1)
         self.minFDE = minFDE(max_guesses=1)
-        self.TokenCls = TokenCls(max_guesses=1)
 
         self.test_predictions = dict()
-        self.cls_loss = nn.CrossEntropyLoss(label_smoothing=0.1)
-        self.map_cls_loss = nn.CrossEntropyLoss(label_smoothing=0.1)
-        self.inference_token = False
-        self.rollout_num = 1
 
     def get_trajectory_token(self):
         token_data = pickle.load(open(self.token_path, 'rb'))
@@ -125,8 +124,8 @@ class SMART(pl.LightningModule):
         res = self.encoder(data)
         return res
 
-    def inference(self, data: HeteroData):
-        res = self.encoder.inference(data)
+    def inference(self, data: HeteroData, rollout_steps=None):
+        res = self.encoder.inference(data, rollout_steps=rollout_steps)
         return res
 
     def maybe_autocast(self, dtype=torch.float16):
@@ -137,21 +136,52 @@ class SMART(pl.LightningModule):
         else:
             return contextlib.nullcontext()
 
+    def compute_flow_loss(self,
+                          pred_segments: torch.Tensor,
+                          target_segments: torch.Tensor,
+                          valid_mask: torch.Tensor) -> torch.Tensor:
+        if pred_segments.numel() == 0:
+            return torch.zeros((), device=self.device)
+        weight = valid_mask.unsqueeze(-1).to(pred_segments.dtype)
+        denom = (weight.sum() * pred_segments.size(-1)).clamp_min(1.0)
+        return (((pred_segments - target_segments) ** 2) * weight).sum() / denom
+
+    def compute_overlap_loss(self,
+                             pred_segments: torch.Tensor,
+                             valid_mask: torch.Tensor) -> torch.Tensor:
+        if pred_segments.numel() == 0:
+            return torch.zeros((), device=self.device)
+        left = pred_segments[:, :-1, -1]
+        right = pred_segments[:, 1:, 0]
+        overlap_valid = (valid_mask[:, :-1, -1] & valid_mask[:, 1:, 0]).unsqueeze(-1).to(pred_segments.dtype)
+        denom = (overlap_valid.sum() * pred_segments.size(-1)).clamp_min(1.0)
+        return (((left - right) ** 2) * overlap_valid).sum() / denom
+
+    def compute_rollout_loss(self,
+                             pred_traj: torch.Tensor,
+                             gt: torch.Tensor,
+                             valid_mask: torch.Tensor) -> torch.Tensor:
+        weight = valid_mask.unsqueeze(-1).to(pred_traj.dtype)
+        denom = (weight.sum() * pred_traj.size(-1)).clamp_min(1.0)
+        return (((pred_traj - gt) ** 2) * weight).sum() / denom
+
     def training_step(self,
                       data,
                       batch_idx):
         data = self.match_token_map(data)
         data = self.sample_pt_pred(data)
-        if isinstance(data, Batch):
-            data['agent']['av_index'] += data['agent']['ptr'][:-1]
         pred = self(data)
-        next_token_prob = pred['next_token_prob']
-        next_token_idx_gt = pred['next_token_idx_gt']
-        next_token_eval_mask = pred['next_token_eval_mask']
-        cls_loss = self.cls_loss(next_token_prob[next_token_eval_mask], next_token_idx_gt[next_token_eval_mask])
-        loss = cls_loss
+        flow_loss = self.compute_flow_loss(pred['pred_segments'], pred['target_segments'], pred['target_valid_mask'])
+        overlap_loss = self.compute_overlap_loss(pred['pred_segments'], pred['target_valid_mask'])
+        loss = flow_loss + overlap_loss
+        if self.closed_loop_steps > 0:
+            rollout = self.inference(data, rollout_steps=self.closed_loop_steps * 5)
+            rollout_loss = self.compute_rollout_loss(rollout['pred_traj'], rollout['gt'], rollout['valid_mask'])
+            loss = loss + rollout_loss
+            self.log('train_rollout_loss', rollout_loss, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
         self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
-        self.log('cls_loss', cls_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
+        self.log('train_flow_loss', flow_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
+        self.log('train_overlap_loss', overlap_loss, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
         return loss
 
     def validation_step(self,
@@ -159,42 +189,23 @@ class SMART(pl.LightningModule):
                         batch_idx):
         data = self.match_token_map(data)
         data = self.sample_pt_pred(data)
-        if isinstance(data, Batch):
-            data['agent']['av_index'] += data['agent']['ptr'][:-1]
         pred = self(data)
-        next_token_idx = pred['next_token_idx']
-        next_token_idx_gt = pred['next_token_idx_gt']
-        next_token_eval_mask = pred['next_token_eval_mask']
-        next_token_prob = pred['next_token_prob']
-        cls_loss = self.cls_loss(next_token_prob[next_token_eval_mask], next_token_idx_gt[next_token_eval_mask])
-        loss = cls_loss
-        self.TokenCls.update(pred=next_token_idx[next_token_eval_mask], target=next_token_idx_gt[next_token_eval_mask],
-                        valid_mask=next_token_eval_mask[next_token_eval_mask])
-        self.log('val_cls_acc', self.TokenCls, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
+        flow_loss = self.compute_flow_loss(pred['pred_segments'], pred['target_segments'], pred['target_valid_mask'])
+        overlap_loss = self.compute_overlap_loss(pred['pred_segments'], pred['target_valid_mask'])
+        loss = flow_loss + overlap_loss
         self.log('val_loss', loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
+        self.log('val_flow_loss', flow_loss, prog_bar=False, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
+        self.log('val_overlap_loss', overlap_loss, prog_bar=False, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
 
-        eval_mask = data['agent']['valid_mask'][:, self.num_historical_steps-1]  # * (data['agent']['category'] == 3)
-        if self.inference_token:
-            pred = self.inference(data)
-            pos_a = pred['pos_a']
-            gt = pred['gt']
-            valid_mask = data['agent']['valid_mask'][:, self.num_historical_steps:]
-            pred_traj = pred['pred_traj']
-            # next_token_idx = pred['next_token_idx'][..., None]
-            # next_token_idx_gt = pred['next_token_idx_gt'][:, 2:]
-            # next_token_eval_mask = pred['next_token_eval_mask'][:, 2:]
-            # next_token_eval_mask[:, 1:] = False
-            # self.TokenCls.update(pred=next_token_idx[next_token_eval_mask], target=next_token_idx_gt[next_token_eval_mask],
-            #                      valid_mask=next_token_eval_mask[next_token_eval_mask])
-            # self.log('val_inference_cls_acc', self.TokenCls, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
-            eval_mask = data['agent']['valid_mask'][:, self.num_historical_steps-1]
+        rollout = self.inference(data)
+        eval_mask = (data['agent']['type'] != 3) & data['agent']['valid_mask'][:, self.num_historical_steps - 1]
+        self.minADE.update(pred=rollout['pred_traj'][eval_mask], target=rollout['gt'][eval_mask],
+                           valid_mask=rollout['valid_mask'][eval_mask])
+        self.minFDE.update(pred=rollout['pred_traj'][eval_mask], target=rollout['gt'][eval_mask],
+                           valid_mask=rollout['valid_mask'][eval_mask])
 
-            self.minADE.update(pred=pred_traj[eval_mask], target=gt[eval_mask], valid_mask=valid_mask[eval_mask])
-            self.minFDE.update(pred=pred_traj[eval_mask], target=gt[eval_mask], valid_mask=valid_mask[eval_mask])
-            # print('ade: ', self.minADE.compute(), 'fde: ', self.minFDE.compute())
-
-            self.log('val_minADE', self.minADE, prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
-            self.log('val_minFDE', self.minFDE, prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
+        self.log('val_minADE', self.minADE, prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
+        self.log('val_minFDE', self.minFDE, prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
 
     def on_validation_start(self):
         self.gt = []

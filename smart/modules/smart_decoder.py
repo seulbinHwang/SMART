@@ -2,7 +2,7 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 from torch_geometric.data import HeteroData
-from smart.modules.agent_decoder import SMARTAgentDecoder
+from smart.modules.agent_flow_decoder import SMARTAgentFlowDecoder
 from smart.modules.map_decoder import SMARTMapDecoder
 
 
@@ -25,6 +25,9 @@ class SMARTDecoder(nn.Module):
                  dropout: float,
                  map_token: Dict,
                  token_data: Dict,
+                 future_window_steps: int,
+                 ode_steps: int,
+                 anchor_chunk_k: int,
                  use_intention=False,
                  token_size=512) -> None:
         super(SMARTDecoder, self).__init__()
@@ -41,7 +44,7 @@ class SMARTDecoder(nn.Module):
             dropout=dropout,
             map_token=map_token
         )
-        self.agent_encoder = SMARTAgentDecoder(
+        self.agent_encoder = SMARTAgentFlowDecoder(
             dataset=dataset,
             input_dim=input_dim,
             hidden_dim=hidden_dim,
@@ -55,7 +58,10 @@ class SMARTDecoder(nn.Module):
             head_dim=head_dim,
             dropout=dropout,
             token_size=token_size,
-            token_data=token_data
+            token_data=token_data,
+            future_window_steps=future_window_steps,
+            ode_steps=ode_steps,
+            anchor_chunk_k=anchor_chunk_k,
         )
         self.map_enc = None
 
@@ -64,11 +70,11 @@ class SMARTDecoder(nn.Module):
         agent_enc = self.agent_encoder(data, map_enc)
         return {**map_enc, **agent_enc}
 
-    def inference(self, data: HeteroData) -> Dict[str, torch.Tensor]:
+    def inference(self, data: HeteroData, rollout_steps=None) -> Dict[str, torch.Tensor]:
         map_enc = self.map_encoder(data)
-        agent_enc = self.agent_encoder.inference(data, map_enc)
+        agent_enc = self.agent_encoder.inference(data, map_enc, rollout_steps=rollout_steps)
         return {**map_enc, **agent_enc}
 
-    def inference_no_map(self, data: HeteroData, map_enc) -> Dict[str, torch.Tensor]:
-        agent_enc = self.agent_encoder.inference(data, map_enc)
+    def inference_no_map(self, data: HeteroData, map_enc, rollout_steps=None) -> Dict[str, torch.Tensor]:
+        agent_enc = self.agent_encoder.inference(data, map_enc, rollout_steps=rollout_steps)
         return {**map_enc, **agent_enc}

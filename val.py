@@ -11,7 +11,7 @@ from smart.utils.log import Logging
 if __name__ == '__main__':
     pl.seed_everything(2, workers=True)
     parser = ArgumentParser()
-    parser.add_argument('--config', type=str, default="configs/validation/validation_scalable.yaml")
+    parser.add_argument('--config', type=str, default="configs/validation/validation_flow.yaml")
     parser.add_argument('--pretrain_ckpt', type=str, default="")
     parser.add_argument('--ckpt_path', type=str, default="")
     parser.add_argument('--save_ckpt_path', type=str, default="")
