@@ -1,33 +1,42 @@
 from typing import Dict, Optional
+
 import torch
 import torch.nn as nn
 from torch_geometric.data import HeteroData
-from smart.modules.agent_decoder import SMARTAgentDecoder
+
+from smart.modules.agent_flow_decoder import SMARTAgentFlowDecoder
 from smart.modules.map_decoder import SMARTMapDecoder
 
 
 class SMARTDecoder(nn.Module):
+    """SMART의 map encoder + flow-based agent decoder 묶음."""
 
-    def __init__(self,
-                 dataset: str,
-                 input_dim: int,
-                 hidden_dim: int,
-                 num_historical_steps: int,
-                 pl2pl_radius: float,
-                 time_span: Optional[int],
-                 pl2a_radius: float,
-                 a2a_radius: float,
-                 num_freq_bands: int,
-                 num_map_layers: int,
-                 num_agent_layers: int,
-                 num_heads: int,
-                 head_dim: int,
-                 dropout: float,
-                 map_token: Dict,
-                 token_data: Dict,
-                 use_intention=False,
-                 token_size=512) -> None:
-        super(SMARTDecoder, self).__init__()
+    def __init__(
+        self,
+        dataset: str,
+        input_dim: int,
+        hidden_dim: int,
+        num_historical_steps: int,
+        pl2pl_radius: float,
+        time_span: Optional[int],
+        pl2a_radius: float,
+        a2a_radius: float,
+        num_freq_bands: int,
+        num_map_layers: int,
+        num_agent_layers: int,
+        num_heads: int,
+        head_dim: int,
+        dropout: float,
+        map_token: Dict,
+        token_data: Dict,
+        use_intention: bool = False,
+        token_size: int = 512,
+        future_window_steps: int = 20,
+        anchor_chunk_k: int = 4,
+        ode_steps: int = 4,
+    ) -> None:
+        super().__init__()
+        del use_intention
         self.map_encoder = SMARTMapDecoder(
             dataset=dataset,
             input_dim=input_dim,
@@ -39,9 +48,9 @@ class SMARTDecoder(nn.Module):
             num_heads=num_heads,
             head_dim=head_dim,
             dropout=dropout,
-            map_token=map_token
+            map_token=map_token,
         )
-        self.agent_encoder = SMARTAgentDecoder(
+        self.agent_encoder = SMARTAgentFlowDecoder(
             dataset=dataset,
             input_dim=input_dim,
             hidden_dim=hidden_dim,
@@ -54,10 +63,12 @@ class SMARTDecoder(nn.Module):
             num_heads=num_heads,
             head_dim=head_dim,
             dropout=dropout,
+            token_data=token_data,
             token_size=token_size,
-            token_data=token_data
+            future_window_steps=future_window_steps,
+            anchor_chunk_k=anchor_chunk_k,
+            ode_steps=ode_steps,
         )
-        self.map_enc = None
 
     def forward(self, data: HeteroData) -> Dict[str, torch.Tensor]:
         map_enc = self.map_encoder(data)
@@ -69,6 +80,6 @@ class SMARTDecoder(nn.Module):
         agent_enc = self.agent_encoder.inference(data, map_enc)
         return {**map_enc, **agent_enc}
 
-    def inference_no_map(self, data: HeteroData, map_enc) -> Dict[str, torch.Tensor]:
+    def inference_no_map(self, data: HeteroData, map_enc: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         agent_enc = self.agent_encoder.inference(data, map_enc)
         return {**map_enc, **agent_enc}
