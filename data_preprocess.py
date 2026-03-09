@@ -666,7 +666,7 @@ def wm2argo(file, dir_name, output_dir):
     for cnt, data in enumerate(dataset):
         print(cnt)
         scenario = scenario_pb2.Scenario()
-        scenario.ParseFromString(bytearray(data.numpy()))
+        scenario.ParseFromString(data.numpy())
         save_infos = process_single_data(scenario) # pkl2mtr
         map_info = save_infos["map_infos"]
         track_info = save_infos['track_infos']

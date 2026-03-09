@@ -145,7 +145,7 @@ class WaymoTargetBuilder(BaseTransform):
                                      theta.unsqueeze(-1))
         return his, target
 
-    def __call__(self, data) -> HeteroData:
+    def forward(self, data) -> HeteroData:
         agent = data["agent"]
         self.score_ego_agent(agent)
         self.score_trained_vehicle(agent, max_num=32)

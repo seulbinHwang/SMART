@@ -48,11 +48,10 @@ def normalize_heading_components(states: torch.Tensor, eps: float = 1e-6) -> tor
         torch.Tensor: 입력과 같은 shape.
             마지막 두 값만 정규화된 tensor.
     """
-    out = states.clone()
-    heading = out[..., 2:4]
+    heading = states[..., 2:4]
     norm = torch.linalg.norm(heading, dim=-1, keepdim=True).clamp_min(eps)
-    out[..., 2:4] = heading / norm
-    return out
+    normalized_heading = heading / norm
+    return torch.cat([states[..., :2], normalized_heading], dim=-1)
 
 
 def chunk_future_21_to_4x6(future: torch.Tensor) -> torch.Tensor:
