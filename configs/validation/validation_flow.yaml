@@ -63,3 +63,16 @@ Model:
     ode_steps: 4
     overlap_loss_weight: 0.1
     closed_loop_eval: True
+  visualization:
+    enabled: False
+    output_dir: "rollout_vis"
+    scenario_index_in_batch: 0
+    max_scenarios: 1
+    save_gap_sec: 0.1
+    raw_step_sec: 0.1
+    trajectory_mode: "line"
+    figsize: [12.0, 12.0]
+    dpi: 180
+    margin_m: 20.0
+    video_fps:
+    draw_agent_ids: False

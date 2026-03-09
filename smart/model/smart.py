@@ -15,6 +15,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from smart.metrics import AverageMeter, minADE, minFDE
 from smart.modules import SMARTDecoder
+from smart.utils.rollout_visualizer import build_rollout_visualization_config, render_rollout_visualization
 
 
 class SMART(pl.LightningModule):
@@ -77,6 +78,8 @@ class SMART(pl.LightningModule):
         self.val_open_loop_ade = AverageMeter()
         self.val_overlap = AverageMeter()
         self.val_flow = AverageMeter()
+        self.rollout_vis_config = build_rollout_visualization_config(model_config)
+        self._rollout_vis_saved = 0
 
     def get_trajectory_token(self) -> Dict:
         """SMART agent token 사전을 읽는다.
@@ -220,6 +223,61 @@ class SMART(pl.LightningModule):
             return int(data.num_graphs)
         return 1
 
+    def _should_save_rollout_visualization(self) -> bool:
+        return (
+            bool(self.rollout_vis_config.enabled)
+            and int(getattr(self, 'global_rank', 0)) == 0
+            and self._rollout_vis_saved < int(self.rollout_vis_config.max_scenarios)
+        )
+
+    def _prepare_rollout_visualization_inputs(self, data):
+        if not self._should_save_rollout_visualization():
+            return None, None
+
+        if isinstance(data, Batch):
+            data_list = data.to_data_list()
+            if len(data_list) == 0:
+                return None, None
+            scenario_index = min(
+                max(int(self.rollout_vis_config.scenario_index_in_batch), 0),
+                len(data_list) - 1,
+            )
+            agent_ptr = data['agent']['ptr']
+            agent_range = (int(agent_ptr[scenario_index].item()), int(agent_ptr[scenario_index + 1].item()))
+            return data_list[scenario_index], agent_range
+
+        num_nodes = data['agent']['num_nodes']
+        if isinstance(num_nodes, torch.Tensor):
+            num_nodes = int(num_nodes.item())
+        else:
+            num_nodes = int(num_nodes)
+        return data.clone(), (0, num_nodes)
+
+    def _slice_rollout_for_visualization(self, rollout, agent_range):
+        if rollout is None or agent_range is None:
+            return None
+        start, end = agent_range
+        return {
+            'pred_traj': rollout['pred_traj'][start:end],
+            'pred_head': rollout['pred_head'][start:end],
+            'pred_valid_mask': rollout.get('pred_valid_mask', None)[start:end]
+            if rollout.get('pred_valid_mask', None) is not None
+            else None,
+            'gt': rollout['gt'][start:end],
+            'valid_mask': rollout['valid_mask'][start:end],
+        }
+
+    def _maybe_save_rollout_visualization(self, scenario_data, rollout, batch_idx: int) -> None:
+        if scenario_data is None or rollout is None or not self._should_save_rollout_visualization():
+            return
+        render_rollout_visualization(
+            scenario_data=scenario_data,
+            rollout=rollout,
+            config=self.rollout_vis_config,
+            batch_idx=int(batch_idx),
+        )
+        self._rollout_vis_saved += 1
+
     def training_step(self, data, batch_idx):
         """한 step의 open-loop flow 학습을 수행한다.
 
@@ -256,7 +314,8 @@ class SMART(pl.LightningModule):
             data: batch HeteroData.
             batch_idx: Lightning batch index.
         """
-        del batch_idx
+        vis_scenario_data, vis_agent_range = self._prepare_rollout_visualization_inputs(data)
+
         data = self.match_token_map(data)
         data = self.sample_pt_pred(data)
         if isinstance(data, Batch):
@@ -273,8 +332,11 @@ class SMART(pl.LightningModule):
         self.log('val_overlap_loss', self.val_overlap, prog_bar=False, on_step=False, on_epoch=True, batch_size=batch_size, sync_dist=True)
         self.log('val_open_loop_ade', self.val_open_loop_ade, prog_bar=True, on_step=False, on_epoch=True, batch_size=batch_size, sync_dist=True)
 
-        if self.closed_loop_eval:
+        rollout = None
+        if self.closed_loop_eval or self._should_save_rollout_visualization():
             rollout = self.inference(data)
+
+        if self.closed_loop_eval and rollout is not None:
             eval_mask = data['agent']['valid_mask'][:, self.num_historical_steps - 1] & (data['agent']['type'] != 3)
             self.minADE.update(
                 pred=rollout['pred_traj'][eval_mask],
@@ -289,6 +351,10 @@ class SMART(pl.LightningModule):
             self.log('val_rollout_minADE', self.minADE, prog_bar=True, on_step=False, on_epoch=True, batch_size=batch_size, sync_dist=True)
             self.log('val_rollout_minFDE', self.minFDE, prog_bar=True, on_step=False, on_epoch=True, batch_size=batch_size, sync_dist=True)
 
+        if rollout is not None:
+            vis_rollout = self._slice_rollout_for_visualization(rollout, vis_agent_range)
+            self._maybe_save_rollout_visualization(vis_scenario_data, vis_rollout, batch_idx=batch_idx)
+
     def on_validation_start(self) -> None:
         """검증 누적값을 초기화한다."""
         self.minADE.reset()
@@ -296,6 +362,7 @@ class SMART(pl.LightningModule):
         self.val_flow.reset()
         self.val_overlap.reset()
         self.val_open_loop_ade.reset()
+        self._rollout_vis_saved = 0
 
     def configure_optimizers(self):
         """optimizer와 cosine scheduler를 만든다.

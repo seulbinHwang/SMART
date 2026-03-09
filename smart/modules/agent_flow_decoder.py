@@ -1037,6 +1037,7 @@ class SMARTAgentFlowDecoder(SMARTAgentDecoder):
             Dict[str, torch.Tensor]:
                 - pred_traj: shape `(A, T, 2)`
                 - pred_head: shape `(A, T)`
+                - pred_valid_mask: shape `(A, T)`
                 - gt: shape `(A, T, 2)`
                 - valid_mask: shape `(A, T)`
         """
@@ -1059,6 +1060,12 @@ class SMARTAgentFlowDecoder(SMARTAgentDecoder):
             rollout_steps,
             device=rollout_data['agent']['heading'].device,
             dtype=rollout_data['agent']['heading'].dtype,
+        )
+        pred_valid_mask = torch.zeros(
+            rollout_data['agent']['num_nodes'],
+            rollout_steps,
+            device=rollout_data['agent']['valid_mask'].device,
+            dtype=torch.bool,
         )
         initial_gt = data['agent']['position'][:, self.num_historical_steps:self.num_historical_steps + rollout_steps, : self.input_dim].contiguous()
         initial_valid = data['agent']['valid_mask'][:, self.num_historical_steps:self.num_historical_steps + rollout_steps].clone()
@@ -1117,10 +1124,12 @@ class SMARTAgentFlowDecoder(SMARTAgentDecoder):
 
             pred_traj[target_indices, rollout_step * self.shift:(rollout_step + 1) * self.shift] = step_pos
             pred_head[target_indices, rollout_step * self.shift:(rollout_step + 1) * self.shift] = step_heading
+            pred_valid_mask[target_indices, rollout_step * self.shift:(rollout_step + 1) * self.shift] = True
 
         return {
             'pred_traj': pred_traj,
             'pred_head': pred_head,
+            'pred_valid_mask': pred_valid_mask,
             'gt': initial_gt,
             'valid_mask': initial_valid,
         }
