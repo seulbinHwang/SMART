@@ -1,4 +1,3 @@
-
 from smart.utils.geometry import angle_between_2d_vectors
 from smart.utils.geometry import angle_between_3d_vectors
 from smart.utils.geometry import side_to_directed_lineseg
@@ -17,4 +16,6 @@ from smart.utils.flow_traj import chunk_future_21_to_4x6
 from smart.utils.flow_traj import get_valid_anchor_indices
 from smart.utils.flow_traj import global_last_pose_from_local_segment
 from smart.utils.flow_traj import local_future_from_global
+from smart.utils.flow_traj import midpoint_ode_solve
+from smart.utils.flow_traj import normalize_heading_components
 from smart.utils.flow_traj import overlap_consistency_error

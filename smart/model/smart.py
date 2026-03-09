@@ -4,7 +4,7 @@ import contextlib
 import math
 import os
 import pickle
-from typing import Dict
+from typing import Dict, Optional
 
 import numpy as np
 import pytorch_lightning as pl
@@ -39,6 +39,7 @@ class SMART(pl.LightningModule):
         self.anchor_chunk_k = getattr(model_config.decoder, 'anchor_chunk_k', 4)
         self.ode_steps = getattr(model_config.decoder, 'ode_steps', 4)
         self.overlap_loss_weight = getattr(model_config.decoder, 'overlap_loss_weight', 0.1)
+        self.closed_loop_steps = int(getattr(model_config.decoder, 'closed_loop_steps', 0))
         self.closed_loop_eval = getattr(model_config.decoder, 'closed_loop_eval', True)
         self.vis_map = False
         self.noise = True
@@ -114,16 +115,22 @@ class SMART(pl.LightningModule):
         """
         return self.encoder(data)
 
-    def inference(self, data: HeteroData) -> Dict[str, torch.Tensor]:
+    def inference(
+        self,
+        data: HeteroData,
+        rollout_steps: Optional[int] = None,
+    ) -> Dict[str, torch.Tensor]:
         """closed-loop rollout 추론을 수행한다.
 
         Args:
             data: SMART 입력 HeteroData.
+            rollout_steps: 실제로 굴릴 raw step 수.
+                None이면 전체 8초를 끝까지 굴린다.
 
         Returns:
             rollout 예측 결과 dict.
         """
-        return self.encoder.inference(data)
+        return self.encoder.inference(data, rollout_steps=rollout_steps)
 
     def maybe_autocast(self, dtype: torch.dtype = torch.float16):
         """GPU일 때만 autocast를 켠다.
@@ -174,6 +181,45 @@ class SMART(pl.LightningModule):
             'open_loop_ade': open_loop_ade,
         }
 
+
+    def _compute_rollout_loss(
+        self,
+        data: HeteroData,
+        rollout: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """짧은 closed-loop fine-tuning용 rollout loss를 계산한다.
+
+        Args:
+            data: 현재 batch HeteroData.
+            rollout: `inference()` 결과 dict.
+
+        Returns:
+            torch.Tensor: scalar rollout loss.
+        """
+        eval_mask = data['agent']['valid_mask'][:, self.num_historical_steps - 1] & (data['agent']['type'] != 3)
+        if int(eval_mask.sum().item()) == 0:
+            return self._empty_loss()
+        pred = rollout['pred_traj'][eval_mask]
+        gt = rollout['gt'][eval_mask]
+        valid = rollout['valid_mask'][eval_mask]
+        weight = valid.unsqueeze(-1).to(pred.dtype)
+        denom = (weight.sum() * pred.shape[-1]).clamp_min(1.0)
+        return (((pred - gt) ** 2) * weight).sum() / denom
+
+
+    def _batch_size(self, data) -> int:
+        """현재 batch 안의 scene 수를 구한다.
+
+        Args:
+            data: `HeteroData` 또는 `Batch`.
+
+        Returns:
+            int: batch 안의 scene 수.
+        """
+        if isinstance(data, Batch):
+            return int(data.num_graphs)
+        return 1
+
     def training_step(self, data, batch_idx):
         """한 step의 open-loop flow 학습을 수행한다.
 
@@ -191,10 +237,16 @@ class SMART(pl.LightningModule):
             data['agent']['av_index'] += data['agent']['ptr'][:-1]
         pred = self(data)
         losses = self._compute_flow_losses(pred)
-        self.log('train_loss', losses['loss'], prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
-        self.log('train_flow_loss', losses['flow_loss'], prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
-        self.log('train_overlap_loss', losses['overlap_loss'], prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
-        self.log('train_open_loop_ade', losses['open_loop_ade'], prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
+        batch_size = self._batch_size(data)
+        if self.closed_loop_steps > 0:
+            rollout = self.inference(data, rollout_steps=self.closed_loop_steps * self.encoder.agent_encoder.shift)
+            rollout_loss = self._compute_rollout_loss(data, rollout)
+            losses['loss'] = losses['loss'] + rollout_loss
+            self.log('train_rollout_loss', rollout_loss, prog_bar=False, on_step=True, on_epoch=True, batch_size=batch_size)
+        self.log('train_loss', losses['loss'], prog_bar=True, on_step=True, on_epoch=True, batch_size=batch_size)
+        self.log('train_flow_loss', losses['flow_loss'], prog_bar=False, on_step=True, on_epoch=True, batch_size=batch_size)
+        self.log('train_overlap_loss', losses['overlap_loss'], prog_bar=False, on_step=True, on_epoch=True, batch_size=batch_size)
+        self.log('train_open_loop_ade', losses['open_loop_ade'], prog_bar=True, on_step=True, on_epoch=True, batch_size=batch_size)
         return losses['loss']
 
     def validation_step(self, data, batch_idx):
@@ -211,14 +263,15 @@ class SMART(pl.LightningModule):
             data['agent']['av_index'] += data['agent']['ptr'][:-1]
         pred = self(data)
         losses = self._compute_flow_losses(pred)
+        batch_size = self._batch_size(data)
 
         self.val_flow.update(losses['flow_loss'].detach().view(1))
         self.val_overlap.update(losses['overlap_loss'].detach().view(1))
         self.val_open_loop_ade.update(losses['open_loop_ade'].detach().view(1))
-        self.log('val_loss', losses['loss'], prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
-        self.log('val_flow_loss', self.val_flow, prog_bar=False, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
-        self.log('val_overlap_loss', self.val_overlap, prog_bar=False, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
-        self.log('val_open_loop_ade', self.val_open_loop_ade, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
+        self.log('val_loss', losses['loss'], prog_bar=True, on_step=False, on_epoch=True, batch_size=batch_size, sync_dist=True)
+        self.log('val_flow_loss', self.val_flow, prog_bar=False, on_step=False, on_epoch=True, batch_size=batch_size, sync_dist=True)
+        self.log('val_overlap_loss', self.val_overlap, prog_bar=False, on_step=False, on_epoch=True, batch_size=batch_size, sync_dist=True)
+        self.log('val_open_loop_ade', self.val_open_loop_ade, prog_bar=True, on_step=False, on_epoch=True, batch_size=batch_size, sync_dist=True)
 
         if self.closed_loop_eval:
             rollout = self.inference(data)
@@ -233,8 +286,8 @@ class SMART(pl.LightningModule):
                 target=rollout['gt'][eval_mask],
                 valid_mask=rollout['valid_mask'][eval_mask],
             )
-            self.log('val_rollout_minADE', self.minADE, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
-            self.log('val_rollout_minFDE', self.minFDE, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
+            self.log('val_rollout_minADE', self.minADE, prog_bar=True, on_step=False, on_epoch=True, batch_size=batch_size, sync_dist=True)
+            self.log('val_rollout_minFDE', self.minFDE, prog_bar=True, on_step=False, on_epoch=True, batch_size=batch_size, sync_dist=True)
 
     def on_validation_start(self) -> None:
         """검증 누적값을 초기화한다."""

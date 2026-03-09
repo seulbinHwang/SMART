@@ -19,6 +19,8 @@ from smart.utils import (
     get_valid_anchor_indices,
     global_last_pose_from_local_segment,
     local_future_from_global,
+    midpoint_ode_solve,
+    normalize_heading_components,
     overlap_consistency_error,
     wrap_angle,
 )
@@ -815,6 +817,7 @@ class SMARTAgentFlowDecoder(SMARTAgentDecoder):
             flow_time=flow_time,
         )
         clean_pred = x_t + (1.0 - flow_time.view(-1, 1, 1, 1)) * flow_pred
+        clean_pred = normalize_heading_components(clean_pred)
         future_pred = assemble_4x6_to_21(clean_pred)
         overlap_error = overlap_consistency_error(clean_pred)
         ade = torch.norm(
@@ -942,7 +945,7 @@ class SMARTAgentFlowDecoder(SMARTAgentDecoder):
         rot[:, 1, 1] = cos
         future_pos_global = torch.bmm(local_xy, rot) + anchor_pos.unsqueeze(1)
         delta_heading = torch.atan2(future_local[..., 2], future_local[..., 3])
-        future_heading_global = anchor_heading.unsqueeze(1) + delta_heading
+        future_heading_global = wrap_angle(anchor_heading.unsqueeze(1) + delta_heading)
         return future_pos_global, future_heading_global
 
     def _predict_segments_from_noise(
@@ -951,39 +954,39 @@ class SMARTAgentFlowDecoder(SMARTAgentDecoder):
         map_enc: Mapping[str, torch.Tensor],
         anchor_index: int,
         target_mask: torch.Tensor,
+        x_init: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """추론 때 2.0초 future를 ODE 적분으로 생성한다.
+        """추론 때 2.0초 future를 midpoint ODE로 생성한다.
 
         Args:
             data: 현재 rollout state가 들어 있는 HeteroData.
             map_enc: map encoder 출력.
             anchor_index: 현재 raw frame index.
-            target_mask: shape (A,) bool.
+            target_mask: shape `(A,)` bool.
+            x_init: shape `(A_tgt, 4, 6, 4)` 초기 상태.
+                None이면 표준 가우시안에서 시작한다.
 
         Returns:
-            생성된 미래와 중간 tensor 묶음.
+            Dict[str, torch.Tensor]: 생성된 미래와 중간 tensor 묶음.
         """
         context_mask = self._context_mask(data, anchor_index)
         context_enc = self._encode_context(data, anchor_index, context_mask)
         current = self._build_current_anchor_feature(data, anchor_index, target_mask)
         anchor_pos = current[1]
         anchor_heading = current[2]
-        x = torch.randn(
-            int(target_mask.sum().item()),
-            self.future_segments,
-            self.segment_points,
-            self.state_dim,
-            device=anchor_pos.device,
-            dtype=anchor_pos.dtype,
-        )
-        for step in range(self.ode_steps):
-            t = torch.full(
-                (x.shape[0], 1),
-                (step + 0.5) / float(self.ode_steps),
-                device=x.device,
-                dtype=x.dtype,
+        if x_init is None:
+            x_init = torch.randn(
+                int(target_mask.sum().item()),
+                self.future_segments,
+                self.segment_points,
+                self.state_dim,
+                device=anchor_pos.device,
+                dtype=anchor_pos.dtype,
             )
-            velocity = self._predict_velocity(
+        x_init = normalize_heading_components(x_init)
+
+        def velocity_fn(segment_state: torch.Tensor, flow_time: torch.Tensor) -> torch.Tensor:
+            return self._predict_velocity(
                 data=data,
                 map_enc=map_enc,
                 context_enc=context_enc,
@@ -991,10 +994,16 @@ class SMARTAgentFlowDecoder(SMARTAgentDecoder):
                 anchor_index=anchor_index,
                 anchor_pos=anchor_pos,
                 anchor_heading=anchor_heading,
-                segment_state=x,
-                flow_time=t,
+                segment_state=segment_state,
+                flow_time=flow_time,
             )
-            x = x + velocity / float(self.ode_steps)
+
+        x = midpoint_ode_solve(
+            x_init=x_init,
+            velocity_fn=velocity_fn,
+            steps=self.ode_steps,
+            normalize_heading=True,
+        )
         future_local = assemble_4x6_to_21(x)
         future_pos_global, future_heading_global = self._local_future_to_global(
             future_local=future_local,
@@ -1005,62 +1014,72 @@ class SMARTAgentFlowDecoder(SMARTAgentDecoder):
             'future_local': future_local,
             'future_pos_global': future_pos_global,
             'future_heading_global': future_heading_global,
+            'pred_segments': x,
         }
 
     def inference(
         self,
         data: HeteroData,
         map_enc: Mapping[str, torch.Tensor],
+        rollout_steps: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
-        """8초 closed-loop rollout을 수행한다.
+        """closed-loop rollout을 수행한다.
 
-        구현을 복잡하게 만들지 않기 위해, 각 0.5초 step마다 fresh noise에서 2.0초를
-        다시 생성한다. warm start는 일부 성능 이득이 있을 수 있지만, 현재 목표인
-        최소 수정과 안정성을 위해 기본 경로에서는 넣지 않는다.
+        각 0.5초 step은 새 noise에서 다시 시작한다. warm start는 넣지 않는다.
 
         Args:
             data: SMART 입력.
             map_enc: map encoder 출력.
+            rollout_steps: 실제로 굴릴 raw step 수.
+                None이면 전체 8초를 끝까지 굴린다.
 
         Returns:
-            pred_traj: shape (A, 80, 2)
-            pred_head: shape (A, 80)
-            gt: shape (A, 80, 2)
-            valid_mask: shape (A, 80)
+            Dict[str, torch.Tensor]:
+                - pred_traj: shape `(A, T, 2)`
+                - pred_head: shape `(A, T)`
+                - gt: shape `(A, T, 2)`
+                - valid_mask: shape `(A, T)`
         """
         rollout_data = data.clone()
         total_future = rollout_data['agent']['position'].shape[1] - self.num_historical_steps
+        if rollout_steps is None:
+            rollout_steps = total_future
+        rollout_steps = min(int(rollout_steps), int(total_future))
+        rollout_steps = rollout_steps - (rollout_steps % self.shift)
+
         pred_traj = torch.zeros(
             rollout_data['agent']['num_nodes'],
-            total_future,
+            rollout_steps,
             self.input_dim,
             device=rollout_data['agent']['position'].device,
             dtype=rollout_data['agent']['position'].dtype,
         )
         pred_head = torch.zeros(
             rollout_data['agent']['num_nodes'],
-            total_future,
+            rollout_steps,
             device=rollout_data['agent']['heading'].device,
             dtype=rollout_data['agent']['heading'].dtype,
         )
-        initial_gt = data['agent']['position'][:, self.num_historical_steps:, : self.input_dim].contiguous()
-        initial_valid = data['agent']['valid_mask'][:, self.num_historical_steps:].clone()
+        initial_gt = data['agent']['position'][:, self.num_historical_steps:self.num_historical_steps + rollout_steps, : self.input_dim].contiguous()
+        initial_valid = data['agent']['valid_mask'][:, self.num_historical_steps:self.num_historical_steps + rollout_steps].clone()
 
-        rollout_steps = total_future // self.shift
-        for rollout_step in range(rollout_steps):
+        num_roll_chunks = rollout_steps // self.shift
+        for rollout_step in range(num_roll_chunks):
             current_raw_index = self.num_historical_steps - 1 + rollout_step * self.shift
             target_mask = rollout_data['agent']['valid_mask'][:, current_raw_index] & (rollout_data['agent']['type'] != 3)
             if int(target_mask.sum().item()) == 0:
                 continue
+            target_indices = torch.nonzero(target_mask).squeeze(-1)
+            x_init = None
             pred = self._predict_segments_from_noise(
                 data=rollout_data,
                 map_enc=map_enc,
                 anchor_index=current_raw_index,
                 target_mask=target_mask,
+                x_init=x_init,
             )
-            step_pos = pred['future_pos_global'][:, 1 : self.shift + 1]
-            step_heading = pred['future_heading_global'][:, 1 : self.shift + 1]
-            target_indices = torch.nonzero(target_mask).squeeze(-1)
+            step_pos = pred['future_pos_global'][:, 1:self.shift + 1]
+            step_heading = pred['future_heading_global'][:, 1:self.shift + 1]
 
             rollout_data['agent']['position'][target_indices, current_raw_index + 1: current_raw_index + self.shift + 1, : self.input_dim] = step_pos
             if rollout_data['agent']['position'].shape[-1] > self.input_dim:
@@ -1084,7 +1103,7 @@ class SMARTAgentFlowDecoder(SMARTAgentDecoder):
             next_token_index = current_token_index + 1
             next_token_pos = pred['future_pos_global'][:, self.shift]
             next_token_heading = pred['future_heading_global'][:, self.shift]
-            local_first_chunk = pred['future_local'][:, 0: self.shift + 1, :2]
+            local_first_chunk = pred['future_local'][:, 0:self.shift + 1, :2]
             nearest_token = self._nearest_token_index(
                 agent_type=rollout_data['agent']['type'][target_mask],
                 local_traj_xy=local_first_chunk,
@@ -1096,8 +1115,8 @@ class SMARTAgentFlowDecoder(SMARTAgentDecoder):
             token_vel = (next_token_pos - rollout_data['agent']['token_pos'][target_indices, current_token_index]) / (0.1 * self.shift)
             rollout_data['agent']['token_velocity'][target_indices, next_token_index] = token_vel
 
-            pred_traj[target_indices, rollout_step * self.shift: (rollout_step + 1) * self.shift] = step_pos
-            pred_head[target_indices, rollout_step * self.shift: (rollout_step + 1) * self.shift] = step_heading
+            pred_traj[target_indices, rollout_step * self.shift:(rollout_step + 1) * self.shift] = step_pos
+            pred_head[target_indices, rollout_step * self.shift:(rollout_step + 1) * self.shift] = step_heading
 
         return {
             'pred_traj': pred_traj,

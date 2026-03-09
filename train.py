@@ -33,10 +33,13 @@ if __name__ == '__main__':
         model.load_params_from_file(filename=args.pretrain_ckpt, logger=logger)
 
     trainer_config = config.Trainer
+    closed_loop_steps = int(getattr(config.Model.decoder, 'closed_loop_steps', 0))
+    closed_loop_eval = bool(getattr(config.Model.decoder, 'closed_loop_eval', False))
+    monitor_metric = 'val_rollout_minADE' if closed_loop_steps > 0 and closed_loop_eval else 'val_open_loop_ade'
     model_checkpoint = ModelCheckpoint(
         dirpath=args.save_ckpt_path,
         filename='{epoch:02d}',
-        monitor='val_open_loop_ade',
+        monitor=monitor_metric,
         every_n_epochs=1,
         save_top_k=5,
         mode='min',
